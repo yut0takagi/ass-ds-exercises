@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from io import StringIO
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -69,6 +69,36 @@ def _to_number(x):
         except Exception:
             return None
 
+def _extract_split_events_from_html(html: str) -> List[Tuple[pd.Timestamp, float]]:
+    events: List[Tuple[pd.Timestamp, float]] = []
+    soup = BeautifulSoup(html, "lxml")
+    for tr in soup.find_all("tr"):
+        text = " ".join(tr.get_text(" ", strip=True).split())
+        if "分割" not in text:
+            continue
+        th = tr.find("th")
+        date_ts = _jp_date_to_datetime(th.get_text(strip=True) if th else None)
+        if date_ts is None:
+            continue
+        m = re.search(r"分割\s*[:：]\s*([0-9.]+)株\s*→\s*([0-9.]+)株", text)
+        if not m:
+            continue
+        left, right = m.groups()
+        try:
+            l = float(left)
+            r = float(right)
+            if l > 0:
+                ratio = r / l
+                if ratio > 0:
+                    events.append((date_ts, ratio))
+        except Exception:
+            continue
+    if not events:
+        return []
+    df_ev = pd.DataFrame(events, columns=["date", "ratio"]).groupby("date", as_index=False)["ratio"].prod()
+    return list(df_ev.itertuples(index=False, name=None))
+
+
 def parse_price_table_to_df(table_html: str) -> pd.DataFrame:
     raw = pd.read_html(StringIO(table_html))[0]  # FutureWarning回避のためStringIO経由
 
@@ -104,7 +134,13 @@ def parse_price_table_to_df(table_html: str) -> pd.DataFrame:
 
     prefer = ["date", "open", "high", "low", "close", "volume", "adj_close"]
     ordered = [c for c in prefer if c in df.columns] + [c for c in df.columns if c not in prefer]
-    return df[ordered].reset_index(drop=True)
+
+    # 分割行（イベント行）が read_html の結果に混入している場合に備えて数値列がすべて欠損の行は除去
+    num_cols = [c for c in ["open", "high", "low", "close", "volume", "adj_close"] if c in df.columns]
+    if num_cols:
+        df = df[~df[num_cols].isna().all(axis=1)]
+
+    return df[ordered + [c for c in df.columns if c not in ordered]].reset_index(drop=True)
 
 
 # ===== Seleniumユーティリティ =====
@@ -148,6 +184,7 @@ def crawl_history_and_save(
 ) -> pd.DataFrame:
     driver = build_driver(headless=headless)
     dfs: List[pd.DataFrame] = []
+    all_split_events: List[Tuple[pd.Timestamp, float]] = []
     partial_path = out_csv.replace(".csv", ".partial.csv")
     last_top_key: Optional[str] = None
 
@@ -160,6 +197,12 @@ def crawl_history_and_save(
             except TimeoutException:
                 print(f"[WARN] テーブル待機タイムアウト: page={page} → 打ち切り")
                 break
+
+            # まずイベント抽出（ページ全体HTMLから）
+            page_html = driver.page_source
+            evs = _extract_split_events_from_html(page_html)
+            if evs:
+                all_split_events.extend(evs)
 
             df = fetch_clean_df_from_dom(driver)
             if df is None or df.empty:
@@ -203,6 +246,27 @@ def crawl_history_and_save(
 
     final_df = pd.concat(dfs, ignore_index=True)
     final_df = final_df.drop_duplicates().sort_values("date", ascending=False).reset_index(drop=True)
+
+    # 収集した全イベントから分割調整列を一括生成
+    if all_split_events and "date" in final_df.columns:
+        # 同日イベントは積に集約
+        ev_df = pd.DataFrame(all_split_events, columns=["date", "ratio"]).groupby("date", as_index=False)["ratio"].prod()
+        events_sorted = sorted(list(ev_df.itertuples(index=False, name=None)), key=lambda x: x[0])
+
+        def _factor_for(d: pd.Timestamp) -> float:
+            f = 1.0
+            for ev_date, ratio in events_sorted:
+                if ev_date > d:
+                    f *= ratio
+            return f
+
+        factors = final_df["date"].apply(_factor_for).astype("float64")
+        final_df["split_factor_to_present"] = factors
+        for c in ["open", "high", "low", "close"]:
+            if c in final_df.columns:
+                final_df[f"split_adj_{c}"] = (final_df[c].astype("float64") / factors).astype("float64")
+        if "volume" in final_df.columns:
+            final_df["split_adj_volume"] = (final_df["volume"].astype("float64") * factors).round().astype("Int64")
     final_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
     print(f"[DONE] 完了: {out_csv} (rows={len(final_df)})")
     return final_df
