@@ -183,7 +183,7 @@ def crawl_history_and_save(
                 partial.to_csv(partial_path, index=False, encoding="utf-8-sig")
                 print(f"[SAVE] 部分保存: {partial_path} (rows={len(partial)})")
 
-            time.sleep(1.0)  # マナー
+            time.sleep(1.0)
     except KeyboardInterrupt:
         print("[INTERRUPT] 手動中断 → 部分保存します")
     except Exception as e:
